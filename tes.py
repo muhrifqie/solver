@@ -4,10 +4,11 @@ import webbrowser
 import threading
 import subprocess
 import requests
-from utils.config import HOST, PORT
+from utils.config import PORT
 from utils.logger import logger
 
-BASE_URL = f"http://{HOST}:{PORT}"
+# Always test against localhost; HOST may be 0.0.0.0 (bind-all) on a VPS.
+BASE_URL = f"http://127.0.0.1:{PORT}"
 DOC_URL = f"{BASE_URL}/static/doc.html"
 HEALTH_TIMEOUT = 30
 POLL_INTERVAL = 0.5
@@ -148,7 +149,7 @@ def run_all_tests():
 
 def start_server_process():
     return subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "main:app", "--host", HOST, "--port", str(PORT)],
+        [sys.executable, "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", str(PORT)],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT
     )

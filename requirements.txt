@@ -1,1 +1,6 @@
-fastapi uvicorn camoufox loguru python-dotenv requests
+fastapi
+uvicorn
+camoufox
+loguru
+python-dotenv
+requests

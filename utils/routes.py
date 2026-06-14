@@ -8,6 +8,35 @@ from utils.solvers import solve_turnstile, solve_recaptcha_v3, solve_recaptcha_v
 
 def register_routes(app, server):
 
+    ENDPOINTS = [
+        "/turnstile", "/recaptchav2", "/recaptchav2invisible", "/recaptchav2enterprise",
+        "/recaptchav3", "/recaptchav3enterprise", "/result", "/health",
+    ]
+
+    @app.get("/")
+    async def root():
+        return JSONResponse(content={
+            "name": "captcha-solver",
+            "status": "ok",
+            "capacity": {
+                "max_concurrent": server.max_task_num,
+                "in_progress": server.current_task_num,
+                "free_slots": max(0, server.max_task_num - server.current_task_num),
+                "pool_ready": server.page_pool.qsize(),
+            },
+            "endpoints": ENDPOINTS,
+        })
+
+    @app.get("/health")
+    async def health():
+        return JSONResponse(content={
+            "status": "ok",
+            "max_concurrent": server.max_task_num,
+            "in_progress": server.current_task_num,
+            "free_slots": max(0, server.max_task_num - server.current_task_num),
+            "pool_ready": server.page_pool.qsize(),
+        })
+
     @app.get("/turnstile")
     async def process_turnstile(url: str = Query(...), sitekey: str = Query(...), action: str = Query(None), cdata: str = Query(None)):
         if not url or not sitekey:

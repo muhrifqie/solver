@@ -1,0 +1,21 @@
+[Unit]
+Description=CAPTCHA Solver (multi-port launcher)
+After=network.target
+
+[Service]
+Type=simple
+# Adjust User and WorkingDirectory to your VPS setup.
+User=root
+WorkingDirectory=/opt/solver
+ExecStart=/usr/bin/python3 /opt/solver/launcher.py
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+StandardOutput=append:/var/log/solver-launcher.log
+StandardError=append:/var/log/solver-launcher.log
+
+# Camoufox / Firefox sometimes need a bigger limit for many contexts/pages.
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
