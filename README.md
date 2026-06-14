@@ -15,6 +15,42 @@ CAPTCHA solver (Cloudflare Turnstile, reCAPTCHA v2/v2-invisible/v2-enterprise, r
 
 ---
 
+### Windows VPS — one-command install (PowerShell)
+
+Open **PowerShell as Administrator** on a fresh Windows VPS and paste:
+
+```powershell
+Set-ExecutionPolicy Bypass -Scope Process -Force
+iwr -UseBasicParsing https://raw.githubusercontent.com/muhrifqie/solver/main/install.ps1 | iex
+```
+
+That single command will:
+- install **Git + Python + Node.js** (via `winget`, auto-fallback to Chocolatey) — only if missing,
+- clone this repo to `C:\Users\<you>\solver`,
+- create a **virtualenv** and install all Python deps,
+- **download camoufox**,
+- copy `.env.example` → `.env`,
+- **open the firewall ports** (read from `.env`),
+- create `run.ps1` (and optionally a boot **Scheduled Task** with `-AutoStart`).
+
+Run it with options (download the file first):
+```powershell
+& .\install.ps1 -InstallDir D:\solver -AutoStart   # custom dir + start at boot
+& .\install.ps1 -NoNode                            # skip Node.js
+& .\install.ps1 -Force                             # wipe & re-clone
+```
+
+Start the server anytime:
+```powershell
+& $env:USERPROFILE\solver\run.ps1
+```
+
+Health check: `http://localhost:5032/health`
+
+> It auto re-launches elevated if you forget "Run as Administrator".
+
+---
+
 ### Multi-port + brutal concurrency (VPS)
 
 Each port runs **its own** browser + page pool as an independent process, so:
