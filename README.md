@@ -15,7 +15,9 @@ CAPTCHA solver (Cloudflare Turnstile, reCAPTCHA v2/v2-invisible/v2-enterprise, r
 
 ---
 
-### Windows VPS — one-command install (PowerShell)
+### Windows VPS — one-command dev environment (PowerShell)
+
+`install.ps1` is a **general-purpose** developer setup script (not tied to this project). It installs only the dev tools / frameworks you pick: Git, Python, Node.js, Go, Rust, Docker, **nginx**, **Caddy**, **cloudflared**, Redis, PostgreSQL, VS Code, plus CLI utils (jq, make, vim, openssl, 7zip, wget) and PowerShell 7 + Windows Terminal.
 
 Open **PowerShell as Administrator** on a fresh Windows VPS and paste:
 
@@ -24,30 +26,29 @@ Set-ExecutionPolicy Bypass -Scope Process -Force
 iwr -UseBasicParsing https://raw.githubusercontent.com/muhrifqie/solver/main/install.ps1 | iex
 ```
 
-That single command will:
-- install **Git + Python + Node.js** (via `winget`, auto-fallback to Chocolatey) — only if missing,
-- clone this repo to `C:\Users\<you>\solver`,
-- create a **virtualenv** and install all Python deps,
-- **download camoufox**,
-- copy `.env.example` → `.env`,
-- **open the firewall ports** (read from `.env`),
-- create `run.ps1` (and optionally a boot **Scheduled Task** with `-AutoStart`).
+That installs the **Core** set (Git + Python + Node.js) by default. To choose more, save the file and run with switches:
 
-Run it with options (download the file first):
 ```powershell
-& .\install.ps1 -InstallDir D:\solver -AutoStart   # custom dir + start at boot
-& .\install.ps1 -NoNode                            # skip Node.js
-& .\install.ps1 -Force                             # wipe & re-clone
+& .\install.ps1 -Core -Web -Tunnel -Utils      # categories
+& .\install.ps1 -All                            # install everything
+& .\install.ps1 -Tools go,rust,nginx            # individual tools
+& .\install.ps1 -OpenPorts 80,443,8080          # open firewall ports
+& .\install.ps1 -SetupProfile                   # ll/which/touch/grep/Get-PublicIP/Open-Port
+& .\install.ps1 -List                           # show the full tool catalog
 ```
 
-Start the server anytime:
+Categories: `Core` (git,python,node) · `Lang` (go,rust) · `Container` (docker) · `Web` (nginx,caddy) · `Tunnel` (cloudflared) · `DB` (redis,postgres) · `Editor` (vscode) · `Utils` (jq,make,vim,openssl,7zip,wget) · `Shell` (pwsh,windows-terminal).
+
+Notes:
+- Uses **winget** first, auto-falls back to **Chocolatey** if a tool isn't found.
+- Idempotent: skips tools already installed (use `-Force` to reinstall).
+- Auto re-launches elevated if you forget "Run as Administrator".
+- After install, **open a new terminal** so PATH refreshes.
+
+Quick tunnel to expose any local port to the internet (after installing cloudflared):
 ```powershell
-& $env:USERPROFILE\solver\run.ps1
+cloudflared tunnel --url http://localhost:8080
 ```
-
-Health check: `http://localhost:5032/health`
-
-> It auto re-launches elevated if you forget "Run as Administrator".
 
 ---
 

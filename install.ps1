@@ -1,36 +1,55 @@
 #requires -Version 5.1
 <#
 .SYNOPSIS
-    One-shot installer for the CAPTCHA solver on a Windows VPS.
-    Installs Git, Python and Node.js (only if missing), clones the repo,
-    sets up a virtualenv, installs dependencies, downloads camoufox,
-    configures .env and opens the firewall ports.
+    One-shot developer environment installer for a fresh Windows VPS.
+    Installs only the dev tools / frameworks you actually need - NOT any
+    specific project. Uses winget (preferred), auto-falls back to Chocolatey.
 
 .EXAMPLE
-    # Easiest (run from an ADMIN PowerShell):
+    # Run from an ADMIN PowerShell:
     Set-ExecutionPolicy Bypass -Scope Process -Force
     iwr -UseBasicParsing https://raw.githubusercontent.com/muhrifqie/solver/main/install.ps1 | iex
 
-    # Or with options:
-    & .\install.ps1 -InstallDir D:\solver -AutoStart
+    # Pick categories:
+    & .\install.ps1 -Core -Web -Tunnel -Utils
+    & .\install.ps1 -All
+    & .\install.ps1 -Tools go,rust,nginx
+    & .\install.ps1 -OpenPorts 80,443,8080 -SetupProfile
+
+.NOTES
+    Categories:
+      Core      : git, python, node            (default if nothing is given)
+      Lang      : go, rust
+      Container : docker
+      Web       : nginx, caddy
+      Tunnel    : cloudflared
+      DB        : redis, postgres
+      Editor    : vscode
+      Utils     : jq, make, vim, openssl, 7zip, wget
+      Shell     : pwsh (PowerShell 7), Windows Terminal
 #>
 [CmdletBinding()]
 param(
-    [string]$InstallDir = "$env:USERPROFILE\solver",
-    [string]$RepoUrl    = "https://github.com/muhrifqie/solver.git",
-    [string]$Branch     = "main",
-    [switch]$AutoStart,    # register a Scheduled Task to run at boot
-    [switch]$NoFirewall,   # skip opening firewall ports
-    [switch]$NoNode,       # skip Node.js
-    [switch]$Force         # re-clone even if dir exists
+    [switch]$Core,
+    [switch]$Lang,
+    [switch]$Container,
+    [switch]$Web,
+    [switch]$Tunnel,
+    [switch]$DB,
+    [switch]$Editor,
+    [switch]$Utils,
+    [switch]$Shell,
+    [switch]$All,           # install everything
+    [string[]]$Tools,       # explicit tool names from the catalog
+    [int[]]$OpenPorts,      # e.g. -OpenPorts 80,443,8080
+    [switch]$SetupProfile,  # add handy aliases/functions to $PROFILE
+    [switch]$List,          # just list the catalog and exit
+    [switch]$Force          # reinstall even if a tool is present
 )
 
-# URL used to re-elevate when the script is piped via iex.
-$InstallerUrl = "https://raw.githubusercontent.com/muhrifqie/solver/main/install.ps1"
+$InstallerUrl = 'https://raw.githubusercontent.com/muhrifqie/solver/main/install.ps1'
 
-# --------------------------------------------------------------------------- #
-# Helpers
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------- helpers ---- #
 function Write-Step($m){ Write-Host "==> $m" -ForegroundColor Cyan }
 function Write-Ok($m)  { Write-Host "[OK]  $m" -ForegroundColor Green }
 function Write-Wn($m)  { Write-Host "[!!]  $m" -ForegroundColor Yellow }
@@ -38,47 +57,93 @@ function Write-Err($m) { Write-Host "[X]   $m" -ForegroundColor Red }
 function Test-Cmd($n)  { return [bool](Get-Command $n -ErrorAction SilentlyContinue) }
 
 function Update-EnvPath {
-    $machine = [Environment]::GetEnvironmentVariable('Path','Machine')
-    $user    = [Environment]::GetEnvironmentVariable('Path','User')
-    $env:Path = ($machine + ';' + $user)
+    $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' +
+                [Environment]::GetEnvironmentVariable('Path','User')
 }
 
-# --------------------------------------------------------------------------- #
-# Ensure elevated (auto re-launch as admin)
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------- elevate ---- #
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
-    Write-Wn "Not running as Administrator. Re-launching elevated..."
+    Write-Wn "Not Administrator - re-launching elevated..."
     if ($PSCommandPath -and (Test-Path $PSCommandPath)) {
-        $argList = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"")
-        if ($PSBoundParameters.ContainsKey('InstallDir')) { $argList += '-InstallDir', $InstallDir }
-        if ($PSBoundParameters.ContainsKey('RepoUrl'))    { $argList += '-RepoUrl', $RepoUrl }
-        if ($PSBoundParameters.ContainsKey('Branch'))     { $argList += '-Branch', $Branch }
-        if ($AutoStart)     { $argList += '-AutoStart' }
-        if ($NoFirewall)    { $argList += '-NoFirewall' }
-        if ($NoNode)        { $argList += '-NoNode' }
-        if ($Force)         { $argList += '-Force' }
-        Start-Process powershell.exe -Verb RunAs -ArgumentList $argList
+        $a = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"")
+        foreach($k in 'Core','Lang','Container','Web','Tunnel','DB','Editor','Utils','Shell','All','SetupProfile','Force','List'){
+            if($PSBoundParameters[$k]){ $a += "-$k" }
+        }
+        if($Tools)     { $a += '-Tools',($Tools -join ',') }
+        if($OpenPorts) { $a += '-OpenPorts',($OpenPorts -join ',') }
+        Start-Process powershell.exe -Verb RunAs -ArgumentList $a
     } else {
         $cmd = "Set-ExecutionPolicy Bypass -Scope Process -Force; iwr -UseBasicParsing '$InstallerUrl' | iex"
         Start-Process powershell.exe -Verb RunAs -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-Command',$cmd
     }
     exit
 }
-
 $ErrorActionPreference = 'Stop'
 
-# --------------------------------------------------------------------------- #
-# 1) Detect / install package manager + tools
-# --------------------------------------------------------------------------- #
-Write-Step "Detecting existing tools"
+# ---------------------------------------------------------------- catalog ---- #
+# LogicalName -> WingetId, ChocoPkg, VerifyCmd, Category
+$Catalog = [ordered]@{
+    git         = @{ Winget='Git.Git';                       Choco='git';                        Verify='git';          Cat='core' }
+    python      = @{ Winget='Python.Python.3.12';            Choco='python3';                    Verify='python';       Cat='core' }
+    node        = @{ Winget='OpenJS.NodeJS.LTS';             Choco='nodejs-lts';                 Verify='node';         Cat='core' }
+    go          = @{ Winget='GoLang.Go';                     Choco='golang';                     Verify='go';           Cat='lang' }
+    rust        = @{ Winget='Rustlang.Rustup';               Choco='rustup.install';             Verify='rustc';        Cat='lang' }
+    docker      = @{ Winget='Docker.DockerDesktop';          Choco='docker-desktop';             Verify='docker';       Cat='container' }
+    nginx       = @{ Winget='';                              Choco='nginx';                      Verify='nginx';        Cat='web' }
+    caddy       = @{ Winget='CaddyServer.Caddy';             Choco='caddy';                      Verify='caddy';        Cat='web' }
+    cloudflared = @{ Winget='Cloudflare.cloudflared';        Choco='cloudflared';                Verify='cloudflared';  Cat='tunnel' }
+    redis       = @{ Winget='Redis.Redis';                   Choco='redis-64';                   Verify='redis-cli';    Cat='db' }
+    postgres    = @{ Winget='PostgreSQL.PostgreSQL.16';      Choco='postgresql';                 Verify='psql';         Cat='db' }
+    vscode      = @{ Winget='Microsoft.VisualStudioCode';    Choco='vscode';                     Verify='code';         Cat='editor' }
+    jq          = @{ Winget='jqlang.jq';                     Choco='jq';                         Verify='jq';           Cat='utils' }
+    make        = @{ Winget='GnuWin32.Make';                 Choco='make';                       Verify='make';         Cat='utils' }
+    vim         = @{ Winget='nvim.neovim';                   Choco='neovim';                     Verify='nvim';         Cat='utils' }
+    openssl     = @{ Winget='';                              Choco='openssl.light';              Verify='openssl';      Cat='utils' }
+    sevenzip    = @{ Winget='7zip.7zip';                     Choco='7zip';                       Verify='7z';           Cat='utils' }
+    wget        = @{ Winget='JernejSimoncic.Wget';           Choco='wget';                       Verify='wget';         Cat='utils' }
+    pwsh        = @{ Winget='Microsoft.PowerShell';          Choco='powershell-core';            Verify='pwsh';         Cat='shell' }
+    terminal    = @{ Winget='Microsoft.WindowsTerminal';     Choco='microsoft-windows-terminal'; Verify='wt';           Cat='shell' }
+}
+
+# Show catalog and exit
+if ($List) {
+    Write-Host "Available tools (name -> category):" -ForegroundColor Cyan
+    $Catalog.GetEnumerator() | ForEach-Object {
+        Write-Host ("  {0,-12} {1}" -f $_.Key, $_.Value.Cat)
+    }
+    Write-Host "`nUsage: -Core -Web -Tunnel  |  -All  |  -Tools go,rust,nginx`n"
+    exit
+}
+
+# ---------------------------------------------------------------- resolve ---- #
+if ($All) { $Core=$Lang=$Container=$Web=$Tunnel=$DB=$Editor=$Utils=$Shell=$true }
+$wantedCats = @()
+foreach($pair in @(
+    @($Core,'core'),@($Lang,'lang'),@($Container,'container'),@($Web,'web'),
+    @($Tunnel,'tunnel'),@($DB,'db'),@($Editor,'editor'),@($Utils,'utils'),@($Shell,'shell'))){
+    if($pair[0]){ $wantedCats += $pair[1] }
+}
+if((-not $wantedCats) -and (-not $Tools)){ $wantedCats = @('core') }   # default = core
+
+$want = New-Object System.Collections.Generic.List[string]
+foreach($kv in $Catalog.GetEnumerator()){
+    if($wantedCats -contains $kv.Value.Cat){ $want.Add($kv.Key) }
+}
+foreach($t in ($Tools | Where-Object { $_ })){
+    $t = "$t".Trim().ToLower()
+    if($Catalog.Contains($t)){ $want.Add($t) } else { Write-Wn "Unknown tool: $t (use -List to see catalog)" }
+}
+$want = $want | Sort-Object -Unique
+
+Write-Step "Selected tools: $($want -join ', ')"
+
+# --------------------------------------------------- ensure package mgr ---- #
 Update-EnvPath
 $hasWinget = Test-Cmd winget
 $hasChoco  = Test-Cmd choco
-Write-Ok ("winget={0}  choco={1}" -f $hasWinget, $hasChoco)
-
 if (-not $hasWinget -and -not $hasChoco) {
-    Write-Step "No winget/choco found -> installing Chocolatey"
+    Write-Step "Installing Chocolatey (no winget/choco found)"
     Set-ExecutionPolicy Bypass -Scope Process -Force
     [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
     iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
@@ -88,195 +153,103 @@ if (-not $hasWinget -and -not $hasChoco) {
     if (-not $hasChoco) { throw "Chocolatey install failed" }
     Write-Ok "Chocolatey installed"
 }
+Update-EnvPath
+Write-Ok ("Package manager: winget={0} choco={1}" -f $hasWinget, $hasChoco)
 
-function Install-Pkg {
-    param([string]$WingetId,[string]$ChocoPkg,[string]$Label)
-    Write-Step "Installing $Label"
-    if ($hasWinget) {
-        winget install --id $WingetId -e --source winget `
+# --------------------------------------------------------- install loop ---- #
+function Install-One {
+    param([string]$Name)
+    $t   = $Catalog[$Name]
+    $cmd = $t.Verify
+    Update-EnvPath
+    if ((Test-Cmd $cmd) -and -not $Force) { Write-Ok ("$Name already present ('$cmd') - skipped"); return $true }
+
+    Write-Step "Installing $Name"
+    $ok = $false
+    if ($hasWinget -and $t.Winget) {
+        winget install --id $t.Winget -e --source winget `
             --accept-package-agreements --accept-source-agreements `
-            --disable-interactivity --silent | Out-Null
-        if ($LASTEXITCODE -ne 0) { Write-Wn "winget returned $LASTEXITCODE for $Label" }
-    } elseif ($hasChoco) {
-        choco install $ChocoPkg -y --no-progress | Out-Null
+            --disable-interactivity --silent 2>$null | Out-Null
+        Update-EnvPath
+        if (Test-Cmd $cmd) { $ok = $true }
+    }
+    if (-not $ok -and $hasChoco) {
+        choco install $t.Choco -y --no-progress 2>$null | Out-Null
+        Update-EnvPath
+        if (Test-Cmd $cmd) { $ok = $true }
+    }
+    if ($ok) { Write-Ok "${Name} installed ('$cmd')" }
+    else     { Write-Wn "${Name}: could not verify '$cmd' after install (may need a new shell / reboot for Docker)" }
+    return $ok
+}
+
+$results = [ordered]@{}
+foreach($name in $want){ $results[$name] = Install-One $name }
+
+# ------------------------------------------------------- special hints ---- #
+if ($want -contains 'docker' -and -not (Test-Cmd docker)) {
+    Write-Wn "Docker Desktop needs a sign-out/reboot to finish. Start 'Docker Desktop' afterwards."
+}
+if ($want -contains 'pwsh' -and (Test-Cmd pwsh)) {
+    Write-Ok "PowerShell 7 available - run 'pwsh' for the modern shell."
+}
+if ($want -contains 'cloudflared' -and (Test-Cmd cloudflared)) {
+    Write-Ok "Expose any local port to the internet:  cloudflared tunnel --url http://localhost:8080"
+}
+
+# ----------------------------------------------------------- firewall ---- #
+if ($OpenPorts -and $OpenPorts.Count -gt 0) {
+    $ports = $OpenPorts | Sort-Object -Unique
+    Write-Step "Opening firewall ports: $($ports -join ',')"
+    Get-NetFirewallRule -DisplayName 'DevTools Custom Ports' -ErrorAction SilentlyContinue |
+        Remove-NetFirewallRule -ErrorAction SilentlyContinue
+    New-NetFirewallRule -DisplayName 'DevTools Custom Ports' `
+        -Direction Inbound -Protocol TCP -LocalPort $ports `
+        -Action Allow -Profile Any -Group 'DevTools' | Out-Null
+    Write-Ok "Firewall ports opened"
+}
+
+# -------------------------------------------------------- profile setup ---- #
+if ($SetupProfile) {
+    Write-Step "Enhancing PowerShell profile"
+    if (-not (Test-Path $PROFILE)) { New-Item -ItemType File -Path $PROFILE -Force | Out-Null }
+    $marker = '# >>> devtools profile >>>'
+    $content = Get-Content $PROFILE -Raw -ErrorAction SilentlyContinue
+    if ($content -and $content.Contains($marker)) {
+        Write-Ok "Profile already enhanced"
     } else {
-        throw "No package manager available to install $Label"
-    }
-    Write-Ok "$Label installed"
+        $snip = @"
+$marker
+function ll { Get-ChildItem @args -Force | Format-Table Mode,Length,LastWriteTime,Name -AutoSize }
+function which(`$n){ (Get-Command `$n -ErrorAction SilentlyContinue).Source }
+function touch(`$p){ if(Test-Path `$p){ (Get-Item `$p).LastWriteTime=Get-Date }else{ New-Item -Type File `$p } }
+function grep(`$p,`$f=`$input){ `$input | Select-String `$p @args }
+function Get-PublicIP { (Invoke-RestMethod 'https://api.ipify.org?format=json').ip }
+function Open-Port([int[]]`$Ports){
+  New-NetFirewallRule -DisplayName 'DevTools Custom Ports' -Direction Inbound `
+    -Protocol TCP -LocalPort `$Ports -Action Allow -Profile Any -ErrorAction SilentlyContinue | Out-Null
+  Write-Host "Opened: `$(`$Ports -join ',')"
 }
-
-Update-EnvPath
-if (-not (Test-Cmd git))   { Install-Pkg 'Git.Git'              'git'          'Git' }
-if (-not (Test-Cmd python)){ Install-Pkg 'Python.Python.3.12'   'python'       'Python 3.12' }
-if (-not $NoNode -and -not (Test-Cmd node)){
-                          Install-Pkg 'OpenJS.NodeJS.LTS'      'nodejs-lts'   'Node.js LTS'
-}
-Update-EnvPath
-
-# Resolve python executable (prefer python, fallback to py launcher)
-$pyExe = $null
-foreach($c in @('python','py')){ if (Test-Cmd $c) { $pyExe = (Get-Command $c).Source; break } }
-if (-not $pyExe) { throw "Python still not on PATH after install. Open a new shell and re-run." }
-Write-Ok "Using Python: $pyExe ($(& $pyExe --version 2>&1))"
-
-# --------------------------------------------------------------------------- #
-# 2) Clone / update the repo
-# --------------------------------------------------------------------------- #
-if (Test-Path "$InstallDir\.git") {
-    if ($Force) {
-        Write-Step "-Force: removing existing $InstallDir"
-        Remove-Item -Recurse -Force $InstallDir
-    } else {
-        Write-Step "Repo exists -> pulling latest ($Branch)"
-        Push-Location $InstallDir
-        git fetch --all --quiet
-        git checkout $Branch --quiet 2>$null
-        git pull --quiet
-        Pop-Location
-    }
-}
-if (-not (Test-Path "$InstallDir\.git")) {
-    Write-Step "Cloning $RepoUrl ($Branch) -> $InstallDir"
-    New-Item -ItemType Directory -Force -Path (Split-Path $InstallDir) | Out-Null
-    git clone -b $Branch --quiet $RepoUrl $InstallDir
-}
-
-# --------------------------------------------------------------------------- #
-# 3) Virtualenv + Python deps
-# --------------------------------------------------------------------------- #
-Push-Location $InstallDir
-try {
-    if (-not (Test-Path "$InstallDir\venv\Scripts\python.exe")) {
-        Write-Step "Creating virtualenv"
-        & $pyExe -m venv venv
-    }
-    $venvPy  = "$InstallDir\venv\Scripts\python.exe"
-    $venvPip = "$InstallDir\venv\Scripts\pip.exe"
-
-    Write-Step "Upgrading pip"
-    & $venvPip install --upgrade pip --quiet
-    Write-Step "Installing Python dependencies"
-    & $venvPip install -r requirements.txt --quiet
-    Write-Ok "Python dependencies installed"
-
-    # 4) camoufox browser binary (try fetch, fallback to download)
-    $camo = "$InstallDir\venv\Scripts\camoufox.exe"
-    Write-Step "Downloading camoufox browser"
-    if (Test-Path $camo) {
-        & $camo fetch 2>$null
-        if ($LASTEXITCODE -ne 0) { & $camo download }
-    } else {
-        & $venvPy -m camoufox fetch 2>$null
-        if ($LASTEXITCODE -ne 0) { & $venvPy -m camoufox download }
-    }
-    Write-Ok "camoufox ready"
-} finally {
-    Pop-Location
-}
-
-# --------------------------------------------------------------------------- #
-# 5) .env from template
-# --------------------------------------------------------------------------- #
-if (-not (Test-Path "$InstallDir\.env")) {
-    if (Test-Path "$InstallDir\.env.example") {
-        Write-Step "Creating .env from template"
-        Copy-Item "$InstallDir\.env.example" "$InstallDir\.env"
-        Write-Ok ".env created (edit it to tune THREAD/PAGE_COUNT/PORTS)"
-    }
-} else {
-    Write-Ok ".env already exists, kept as-is"
-}
-
-# --------------------------------------------------------------------------- #
-# 6) Convenience launcher run.ps1
-# --------------------------------------------------------------------------- #
-$runPs1 = @"
-# Auto-generated: run the multi-port CAPTCHA solver launcher via venv.
-Set-Location `$PSScriptRoot
-`$py = "`$PSScriptRoot\venv\Scripts\python.exe"
-if (-not (Test-Path `$py)) { Write-Host 'venv missing - run install.ps1 first' -ForegroundColor Red; exit 1 }
-& `$py launcher.py @args
+Set-Alias -Name open -Value Invoke-Item -ErrorAction SilentlyContinue
+# <<< devtools profile <<<
 "@
-Set-Content -Path "$InstallDir\run.ps1" -Value $runPs1 -Encoding UTF8
-Write-Ok "Created run.ps1"
-
-# --------------------------------------------------------------------------- #
-# 7) Windows firewall
-# --------------------------------------------------------------------------- #
-function Get-SolverPorts {
-    param([string]$EnvFile)
-    $vals = @{}
-    foreach($l in Get-Content $EnvFile -ErrorAction SilentlyContinue){
-        if($l -match '^\s*([A-Z_]+)\s*=\s*(.+?)\s*$'){ $vals[$Matches[1]] = $Matches[2] }
-    }
-    $nums = [System.Collections.Generic.List[int]]::new()
-    if($vals.ContainsKey('PORTS')){
-        foreach($p in ($vals['PORTS'] -split ',')){
-            $p = $p.Trim()
-            if($p -match '^(\d+)-(\d+)$'){ for($i=[int]$Matches[1];$i -le [int]$Matches[2];$i++){ $nums.Add($i) } }
-            elseif($p -match '^\d+$'){ $nums.Add([int]$p) }
-        }
-    }
-    if($nums.Count -eq 0 -and $vals.ContainsKey('PORT_START') -and $vals.ContainsKey('PORT_COUNT')){
-        $s=[int]$vals['PORT_START']; $c=[int]$vals['PORT_COUNT']
-        for($i=$s;$i -lt $s+$c;$i++){ $nums.Add($i) }
-    }
-    if($nums.Count -eq 0 -and $vals.ContainsKey('PORT')){ $nums.Add([int]$vals['PORT']) }
-    if($nums.Count -eq 0){ $nums.Add(5032) }
-    return $nums.ToArray()
-}
-
-if (-not $NoFirewall) {
-    try {
-        $ports = Get-SolverPorts "$InstallDir\.env"
-        $lo = ($ports | Measure-Object -Minimum).Minimum
-        $hi = ($ports | Measure-Object -Maximum).Maximum
-        $spec = if($lo -eq $hi){ "$lo" } else { "$lo-$hi" }
-        Write-Step "Opening firewall ports $spec (inbound TCP)"
-        Get-NetFirewallRule -DisplayName 'CaptchaSolver Ports' -ErrorAction SilentlyContinue |
-            Remove-NetFirewallRule -ErrorAction SilentlyContinue
-        New-NetFirewallRule -DisplayName 'CaptchaSolver Ports' `
-            -Direction Inbound -Protocol TCP -LocalPort $spec `
-            -Action Allow -Profile Any -Group 'CaptchaSolver' | Out-Null
-        Write-Ok "Firewall ports $spec open"
-    } catch {
-        Write-Wn "Firewall step skipped: $($_.Exception.Message)"
+        Add-Content -Path $PROFILE -Value "`n$snip" -Encoding UTF8
+        Write-Ok "Profile enhanced (ll, which, touch, grep, Get-PublicIP, Open-Port)"
     }
 }
 
-# --------------------------------------------------------------------------- #
-# 8) Optional auto-start at boot (Scheduled Task)
-# --------------------------------------------------------------------------- #
-if ($AutoStart) {
-    Write-Step "Registering Scheduled Task 'CaptchaSolver' (AtStartup)"
-    $action   = New-ScheduledTaskAction -Execute 'powershell.exe' `
-                -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$InstallDir\run.ps1`""
-    $trigger  = New-ScheduledTaskTrigger -AtStartup
-    $principal= New-ScheduledTaskPrincipal -UserId 'SYSTEM' -RunLevel Highest -LogonType ServiceAccount
-    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-                -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
-                -ExecutionTimeLimit ([TimeSpan]::Zero)
-    Unregister-ScheduledTask -TaskName 'CaptchaSolver' -Confirm:$false -ErrorAction SilentlyContinue
-    Register-ScheduledTask -TaskName 'CaptchaSolver' -Action $action -Trigger $trigger `
-        -Principal $principal -Settings $settings -Force | Out-Null
-    Write-Ok "Auto-start enabled at boot"
-}
-
-# --------------------------------------------------------------------------- #
-# Done
-# --------------------------------------------------------------------------- #
-$bar = '=' * 64
+# --------------------------------------------------------------- summary ---- #
 Write-Host ""
-Write-Host $bar -ForegroundColor Green
-Write-Host "  CAPTCHA solver installed at: $InstallDir" -ForegroundColor Green
-Write-Host $bar -ForegroundColor Green
-Write-Host "  Start now:        $InstallDir\run.ps1"
-Write-Host "  Start (admin):    Start-Process powershell -Verb RunAs -ArgumentList '-File','$InstallDir\run.ps1'"
-if ($AutoStart) {
-    Write-Host "  Auto-start:       enabled (Scheduled Task 'CaptchaSolver')"
-    Write-Host "  Manage task:      Get-ScheduledTask -TaskName 'CaptchaSolver'"
-}
-Write-Host "  Health check:     http://localhost:5032/health"
-Write-Host "  Edit config:      notepad $InstallDir\.env"
-Write-Host $bar -ForegroundColor Green
+Write-Host ('=' * 64) -ForegroundColor Green
+Write-Host "  Developer environment setup complete" -ForegroundColor Green
+Write-Host ('=' * 64) -ForegroundColor Green
+$installed = $results.GetEnumerator() | Where-Object { $_.Value } | Select-Object -ExpandProperty Key
+$failed    = $results.GetEnumerator() | Where-Object { -not $_.Value } | Select-Object -ExpandProperty Key
+Write-Host ("  Installed/OK : {0}" -f ($(if($installed){$installed -join ', '}else{'-'})))
+Write-Host ("  Verify-fail : {0}" -f ($(if($failed){$failed -join ', '}else{'-'})))
+if ($OpenPorts) { Write-Host ("  Ports opened: {0}" -f ($OpenPorts -join ',')) }
+Write-Host ""
+Write-Host "  Open a NEW terminal (so PATH refreshes), then try e.g.:"
+Write-Host "    git --version ; python --version ; node --version ; nginx -v ; cloudflared --version"
+Write-Host ('=' * 64) -ForegroundColor Green
 Write-Host ""
